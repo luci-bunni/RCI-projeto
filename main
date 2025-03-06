@@ -1,0 +1,249 @@
+#include <unistd.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/select.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <string.h>
+#include <fcntl.h>
+
+#define PORT "58001"
+#define MAX_CLIENTS 10  //definir depois máximo
+
+void handle_input(int *client_fds) {
+    char buffer[128];
+    int n = read(STDIN_FILENO, buffer, sizeof(buffer) - 1);
+    if (n > 0) {
+        buffer[n] = '\0';
+
+        // Parse command
+        char command[16], net[4], connectIP[32], connectTCP[6];
+        int parsed = sscanf(buffer, "%15s %3s %31s %5s", command, net, connectIP, connectTCP);
+
+        if (parsed >= 4 && strcmp(command, "direct") == 0) {
+            printf("Connecting to TCP server at %s:%s on network %s...\n", connectIP, connectTCP, net);
+
+            // Create a new TCP client socket
+            int new_client_fd = TCP_socket();
+
+            // Connect to the specified server
+            join_TCP(new_client_fd, connectIP, connectTCP);
+
+            // Store in client_fds array
+            for (int i = 0; i < MAX_CLIENTS; i++) {
+                if (client_fds[i] == 0) {
+                    client_fds[i] = new_client_fd;
+                    printf("Connected: TCP client FD %d added.\n", new_client_fd);
+                    break;
+                }
+            }
+        } else {
+            printf("Invalid command. Usage: direct join <net> <connectIP> <connectTCP>\n");
+        }
+    }
+}
+
+
+int UDP_socket() {
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd == -1) {
+        perror("UDP socket error");
+        exit(1);
+    }
+    return fd;
+}
+
+void UDP_client(int udp_fd) {
+    char buffer[128];
+    struct addrinfo hints, *res;
+    struct sockaddr_in addr;
+    socklen_t addrlen;
+    int n, errcode;
+
+    memset(&hints, 0, sizeof hints);
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_DGRAM;
+
+    errcode = getaddrinfo("tejo.tecnico.ulisboa.pt", PORT, &hints, &res);
+    if (errcode != 0) {
+        close(udp_fd);
+        exit(1);
+    }
+
+    n = sendto(udp_fd, "NODES 006", strlen("NODES 006\n"), 0, res->ai_addr, res->ai_addrlen);
+    if (n == -1) {
+        perror("UDP sendto error");
+        freeaddrinfo(res);
+        close(udp_fd);
+        exit(1);
+    }
+
+    addrlen = sizeof(addr);
+    n = recvfrom(udp_fd, buffer, sizeof(buffer) - 1, 0, (struct sockaddr*)&addr, &addrlen);
+    if (n == -1) {
+        perror("UDP recvfrom error");
+        freeaddrinfo(res);
+        close(udp_fd);
+        exit(1);
+    }
+
+    buffer[n] = '\0';
+
+    printf("UDP echo: %s\n", buffer);
+
+    // Print received message
+    write(1, "echo: ", 6);
+    write(1, buffer, n);
+
+    freeaddrinfo(res);
+    //close(fd);
+}
+
+int TCP_socket() {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd == -1) {
+        perror("TCP socket error");
+        exit(1);
+    }
+    return fd;
+}
+
+void join_TCP(int fd, const char *node, const char *port){
+    struct addrinfo hints, *res;
+    int n;
+
+    memset(&hints, 0, sizeof hints);
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+
+    n = getaddrinfo(node, port, &hints, &res);
+    if (n != 0) {
+        fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(n));
+        exit(1);
+    }
+
+    n = connect(fd, res->ai_addr, res->ai_addrlen);
+    if (n == -1) {
+        perror("TCP connect error");
+        freeaddrinfo(res);
+        exit(1);
+    }
+
+    freeaddrinfo(res);
+}
+
+int main(void)
+{
+    int tcp_server_fd, udp_fd, maxfd;
+    int client_fds[MAX_CLIENTS] = {0}; // Store active TCP client connections
+    struct sockaddr_in server_addr, client_addr;
+    socklen_t addrlen;
+    fd_set read_fds;
+
+
+    // Create TCP server socket
+    tcp_server_fd = TCP_socket();
+    udp_fd = UDP_socket();
+
+    // Configure TCP server
+    memset(&server_addr, 0, sizeof(server_addr));
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_addr.s_addr = INADDR_ANY;
+    server_addr.sin_port = htons(atoi(PORT));
+
+    if (bind(tcp_server_fd, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
+        perror("bind failed");
+        exit(1);
+    }
+    if (listen(tcp_server_fd, MAX_CLIENTS) < 0) {
+        perror("listen failed");
+        exit(1);
+    }
+
+    // Determine maxfd
+    maxfd = tcp_server_fd > udp_fd ? tcp_server_fd : udp_fd;
+    if (STDIN_FILENO > maxfd) maxfd = STDIN_FILENO;
+
+    while (1) {
+        // 2. Initialize fd_set
+        FD_ZERO(&read_fds);
+
+        // 3. Add file descriptors
+        FD_SET(STDIN_FILENO, &read_fds);     // Standard input
+        FD_SET(tcp_server_fd, &read_fds);    // TCP Server
+        //FD_SET(tcp_client_fd, &read_fds);    // TCP Client
+        FD_SET(udp_fd, &read_fds);           // UDP Client
+
+        // Add active TCP client connections
+        for (int i = 0; i < MAX_CLIENTS; i++) {
+            if (client_fds[i] > 0) {
+                FD_SET(client_fds[i], &read_fds);
+                if (client_fds[i] > maxfd) {
+                    maxfd = client_fds[i];
+                }
+            }
+        }
+
+        int ready = select(maxfd + 1, &read_fds, NULL, NULL, NULL);
+        if (ready == -1) {
+            perror("select");
+            exit(1);
+        }
+
+        // Handle standard input
+        if (FD_ISSET(STDIN_FILENO, &read_fds)) {
+            handle_input(client_fds);
+        }
+
+        // Handle new TCP connections
+        if (FD_ISSET(tcp_server_fd, &read_fds)) {
+            addrlen = sizeof(client_addr);
+            int new_client = accept(tcp_server_fd, (struct sockaddr*)&client_addr, &addrlen);
+            if (new_client < 0) {
+                perror("accept failed");
+                continue;
+            }
+
+            printf("New TCP client connected: %d\n", new_client);
+
+            // Store new client and replace server with new TCP server
+            for (int i = 0; i < MAX_CLIENTS; i++) {
+                if (client_fds[i] == 0) {
+                    client_fds[i] = new_client;
+                    break;
+                }
+            }
+
+            // Replace TCP server with a new TCP server
+            tcp_server_fd = TCP_socket();
+            if (bind(tcp_server_fd, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
+                perror("bind failed");
+                exit(1);
+            }
+            if (listen(tcp_server_fd, MAX_CLIENTS) < 0) {
+                perror("listen failed");
+                exit(1);
+            }
+        }
+
+        // Handle UDP messages
+        if (FD_ISSET(udp_fd, &read_fds)) {
+            UDP_client(udp_fd);
+        }
+
+        if (FD_ISSET(tcp_server_fd, &read_fds)) {
+            printf("TCP Server: Data available\n");
+            // Accept connection or handle request
+        }
+        
+    }
+
+    close(tcp_server_fd);
+    //close(tcp_client_fd);
+    close(udp_fd);
+
+    return 0;
+}
