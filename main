@@ -11,181 +11,188 @@
 #include <fcntl.h>
 
 #define PORT "58001"
-#define MAX_CLIENTS 10  //definir depois máximo
+#define MAX_CLIENTS 10
 
+// Structure to track neighbors
+typedef struct {
+    int external_neighbor;      // External neighbor's socket
+    int safeguard_neighbor;     // External neighbor's external neighbor
+    int internal_neighbors[MAX_CLIENTS];  // List of internal neighbors
+    int internal_count;         // Number of internal neighbors
+    char ip[INET_ADDRSTRLEN];   // Node's IP
+    char tcp[6];                // Node's TCP port
+    char network[4];            // Network name (3-digit identifier)
+} Node;
+
+Node node_info = { .external_neighbor = -1, .safeguard_neighbor = -1, .internal_count = 0 };
+
+// Displays the current topology
+void show_topology() {
+    printf("\n--- TOPOLOGY ---\n");
+    printf("Network: %s\n", node_info.network);
+    printf("External Neighbor: %d\n", node_info.external_neighbor);
+    printf("Safeguard Neighbor: %d\n", node_info.safeguard_neighbor);
+    printf("Internal Neighbors (%d): ", node_info.internal_count);
+    for (int i = 0; i < node_info.internal_count; i++) {
+        printf("%d ", node_info.internal_neighbors[i]);
+    }
+    printf("\n----------------\n");
+}
+
+// Handles user input commands
 void handle_input(int *client_fds) {
     char buffer[128];
     int n = read(STDIN_FILENO, buffer, sizeof(buffer) - 1);
     if (n > 0) {
         buffer[n] = '\0';
 
-        // Parse command
         char command[16], net[4], connectIP[32], connectTCP[6];
         int parsed = sscanf(buffer, "%15s %3s %31s %5s", command, net, connectIP, connectTCP);
 
+        if (strcmp(command, "show") == 0 && strcmp(net, "topology") == 0) {
+            show_topology();
+            return;
+        }
+
         if (parsed >= 4 && strcmp(command, "direct") == 0) {
+            printf("Joining network %s...\n", net);
+            strcpy(node_info.network, net);  // Store network name
+
+            if (strcmp(connectIP, "0.0.0.0") == 0) {
+                // Create a new network where this node is its own external neighbor
+                printf("Creating new network. This node is its own external neighbor.\n");
+                node_info.external_neighbor = -2;  // Special marker for self
+                node_info.safeguard_neighbor = -2;
+                return;
+            }
+
             printf("Connecting to TCP server at %s:%s on network %s...\n", connectIP, connectTCP, net);
 
-            // Create a new TCP client socket
-            int new_client_fd = TCP_socket();
-
-            // Connect to the specified server
-            join_TCP(new_client_fd, connectIP, connectTCP);
-
-            // Store in client_fds array
-            for (int i = 0; i < MAX_CLIENTS; i++) {
-                if (client_fds[i] == 0) {
-                    client_fds[i] = new_client_fd;
-                    printf("Connected: TCP client FD %d added.\n", new_client_fd);
-                    break;
-                }
+            int new_client_fd = socket(AF_INET, SOCK_STREAM, 0);
+            if (new_client_fd == -1) {
+                perror("TCP socket error");
+                return;
             }
+
+            struct sockaddr_in server_addr;
+            memset(&server_addr, 0, sizeof(server_addr));
+            server_addr.sin_family = AF_INET;
+            server_addr.sin_port = htons(atoi(connectTCP));
+            inet_pton(AF_INET, connectIP, &server_addr.sin_addr);
+
+            if (connect(new_client_fd, (struct sockaddr*)&server_addr, sizeof(server_addr)) == -1) {
+                perror("TCP connect error");
+                close(new_client_fd);
+                return;
+            }
+
+            // Update external neighbor and safeguard
+            node_info.external_neighbor = new_client_fd;
+            strcpy(node_info.ip, connectIP);
+            strcpy(node_info.tcp, connectTCP);
+
+            printf("Connected to external neighbor %s:%s\n", connectIP, connectTCP);
+
+            // Send ENTRY message
+            char entry_msg[128];
+            snprintf(entry_msg, sizeof(entry_msg), "ENTRY %s %s\n", node_info.ip, node_info.tcp);
+            send(new_client_fd, entry_msg, strlen(entry_msg), 0);
         } else {
             printf("Invalid command. Usage: direct join <net> <connectIP> <connectTCP>\n");
         }
     }
 }
 
-
-int UDP_socket() {
-    int fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (fd == -1) {
-        perror("UDP socket error");
-        exit(1);
-    }
-    return fd;
-}
-
-void UDP_client(int udp_fd) {
+// Handles TCP messages and updates neighbors
+void process_tcp_message(int fd) {
     char buffer[128];
-    struct addrinfo hints, *res;
-    struct sockaddr_in addr;
-    socklen_t addrlen;
-    int n, errcode;
-
-    memset(&hints, 0, sizeof hints);
-    hints.ai_family = AF_INET;
-    hints.ai_socktype = SOCK_DGRAM;
-
-    errcode = getaddrinfo("tejo.tecnico.ulisboa.pt", PORT, &hints, &res);
-    if (errcode != 0) {
-        close(udp_fd);
-        exit(1);
-    }
-
-    n = sendto(udp_fd, "NODES 006", strlen("NODES 006\n"), 0, res->ai_addr, res->ai_addrlen);
-    if (n == -1) {
-        perror("UDP sendto error");
-        freeaddrinfo(res);
-        close(udp_fd);
-        exit(1);
-    }
-
-    addrlen = sizeof(addr);
-    n = recvfrom(udp_fd, buffer, sizeof(buffer) - 1, 0, (struct sockaddr*)&addr, &addrlen);
-    if (n == -1) {
-        perror("UDP recvfrom error");
-        freeaddrinfo(res);
-        close(udp_fd);
-        exit(1);
+    int n = read(fd, buffer, sizeof(buffer) - 1);
+    if (n <= 0) {
+        printf("Lost connection to neighbor %d\n", fd);
+        close(fd);
+        if (node_info.external_neighbor == fd) {
+            printf("Reconnecting to safeguard neighbor %d\n", node_info.safeguard_neighbor);
+            node_info.external_neighbor = node_info.safeguard_neighbor;
+        }
+        return;
     }
 
     buffer[n] = '\0';
 
-    printf("UDP echo: %s\n", buffer);
+    char type[16], ip[32], tcp[6];
+    if (sscanf(buffer, "%15s %31s %5s", type, ip, tcp) == 3) {
+        if (strcmp(type, "SAFE") == 0) {
+            node_info.safeguard_neighbor = fd;
+            printf("Updated safeguard neighbor to %s:%s\n", ip, tcp);
+        } else if (strcmp(type, "ENTRY") == 0) {
+            if (node_info.internal_count < MAX_CLIENTS) {
+                node_info.internal_neighbors[node_info.internal_count++] = fd;
+                printf("Added internal neighbor %s:%s\n", ip, tcp);
 
-    // Print received message
-    write(1, "echo: ", 6);
-    write(1, buffer, n);
+                if (node_info.external_neighbor == -1) {
+                    node_info.external_neighbor = fd;
+                    printf("Set %s:%s as new external neighbor\n", ip, tcp);
 
-    freeaddrinfo(res);
-    //close(fd);
+                    char safe_msg[128];
+                    snprintf(safe_msg, sizeof(safe_msg), "SAFE %s %s\n", node_info.ip, node_info.tcp);
+                    send(fd, safe_msg, strlen(safe_msg), 0);
+                }
+            }
+        }
+    }
 }
 
-int TCP_socket() {
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd == -1) {
-        perror("TCP socket error");
-        exit(1);
+// Accepts new TCP connections
+void accept_tcp_connection(int server_fd) {
+    struct sockaddr_in client_addr;
+    socklen_t addrlen = sizeof(client_addr);
+    int new_client_fd = accept(server_fd, (struct sockaddr*)&client_addr, &addrlen);
+    if (new_client_fd < 0) {
+        perror("accept failed");
+        return;
     }
-    return fd;
+
+    char client_ip[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, sizeof(client_ip));
+
+    printf("New TCP client connected: %s\n", client_ip);
+
+    if (node_info.external_neighbor != -1) {
+        char safe_msg[128];
+        snprintf(safe_msg, sizeof(safe_msg), "SAFE %s %s\n", node_info.ip, node_info.tcp);
+        send(new_client_fd, safe_msg, strlen(safe_msg), 0);
+    }
+
+    if (node_info.internal_count < MAX_CLIENTS) {
+        node_info.internal_neighbors[node_info.internal_count++] = new_client_fd;
+    }
 }
 
-void join_TCP(int fd, const char *node, const char *port){
-    struct addrinfo hints, *res;
-    int n;
-
-    memset(&hints, 0, sizeof hints);
-    hints.ai_family = AF_INET;
-    hints.ai_socktype = SOCK_STREAM;
-
-    n = getaddrinfo(node, port, &hints, &res);
-    if (n != 0) {
-        fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(n));
-        exit(1);
-    }
-
-    n = connect(fd, res->ai_addr, res->ai_addrlen);
-    if (n == -1) {
-        perror("TCP connect error");
-        freeaddrinfo(res);
-        exit(1);
-    }
-
-    freeaddrinfo(res);
-}
-
-int main(void)
-{
+int main(void) {
     int tcp_server_fd, udp_fd, maxfd;
-    int client_fds[MAX_CLIENTS] = {0}; // Store active TCP client connections
-    struct sockaddr_in server_addr, client_addr;
-    socklen_t addrlen;
     fd_set read_fds;
 
+    tcp_server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
 
-    // Create TCP server socket
-    tcp_server_fd = TCP_socket();
-    udp_fd = UDP_socket();
-
-    // Configure TCP server
-    memset(&server_addr, 0, sizeof(server_addr));
+    struct sockaddr_in server_addr = {0};
     server_addr.sin_family = AF_INET;
     server_addr.sin_addr.s_addr = INADDR_ANY;
     server_addr.sin_port = htons(atoi(PORT));
 
-    if (bind(tcp_server_fd, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
-        perror("bind failed");
-        exit(1);
-    }
-    if (listen(tcp_server_fd, MAX_CLIENTS) < 0) {
-        perror("listen failed");
-        exit(1);
-    }
+    bind(tcp_server_fd, (struct sockaddr*)&server_addr, sizeof(server_addr));
+    listen(tcp_server_fd, MAX_CLIENTS);
 
-    // Determine maxfd
-    maxfd = tcp_server_fd > udp_fd ? tcp_server_fd : udp_fd;
+    maxfd = (tcp_server_fd > udp_fd) ? tcp_server_fd : udp_fd;
     if (STDIN_FILENO > maxfd) maxfd = STDIN_FILENO;
 
     while (1) {
-        // 2. Initialize fd_set
         FD_ZERO(&read_fds);
-
-        // 3. Add file descriptors
-        FD_SET(STDIN_FILENO, &read_fds);     // Standard input
-        FD_SET(tcp_server_fd, &read_fds);    // TCP Server
-        //FD_SET(tcp_client_fd, &read_fds);    // TCP Client
-        FD_SET(udp_fd, &read_fds);           // UDP Client
-
-        // Add active TCP client connections
-        for (int i = 0; i < MAX_CLIENTS; i++) {
-            if (client_fds[i] > 0) {
-                FD_SET(client_fds[i], &read_fds);
-                if (client_fds[i] > maxfd) {
-                    maxfd = client_fds[i];
-                }
-            }
-        }
+        FD_SET(STDIN_FILENO, &read_fds);
+        FD_SET(tcp_server_fd, &read_fds);
+        FD_SET(udp_fd, &read_fds);
+        if (node_info.external_neighbor > 0) FD_SET(node_info.external_neighbor, &read_fds);
+        for (int i = 0; i < node_info.internal_count; i++) FD_SET(node_info.internal_neighbors[i], &read_fds);
 
         int ready = select(maxfd + 1, &read_fds, NULL, NULL, NULL);
         if (ready == -1) {
@@ -193,57 +200,9 @@ int main(void)
             exit(1);
         }
 
-        // Handle standard input
-        if (FD_ISSET(STDIN_FILENO, &read_fds)) {
-            handle_input(client_fds);
-        }
-
-        // Handle new TCP connections
-        if (FD_ISSET(tcp_server_fd, &read_fds)) {
-            addrlen = sizeof(client_addr);
-            int new_client = accept(tcp_server_fd, (struct sockaddr*)&client_addr, &addrlen);
-            if (new_client < 0) {
-                perror("accept failed");
-                continue;
-            }
-
-            printf("New TCP client connected: %d\n", new_client);
-
-            // Store new client and replace server with new TCP server
-            for (int i = 0; i < MAX_CLIENTS; i++) {
-                if (client_fds[i] == 0) {
-                    client_fds[i] = new_client;
-                    break;
-                }
-            }
-
-            // Replace TCP server with a new TCP server
-            tcp_server_fd = TCP_socket();
-            if (bind(tcp_server_fd, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
-                perror("bind failed");
-                exit(1);
-            }
-            if (listen(tcp_server_fd, MAX_CLIENTS) < 0) {
-                perror("listen failed");
-                exit(1);
-            }
-        }
-
-        // Handle UDP messages
-        if (FD_ISSET(udp_fd, &read_fds)) {
-            UDP_client(udp_fd);
-        }
-
-        if (FD_ISSET(tcp_server_fd, &read_fds)) {
-            printf("TCP Server: Data available\n");
-            // Accept connection or handle request
-        }
-        
+        if (FD_ISSET(STDIN_FILENO, &read_fds)) handle_input(node_info.internal_neighbors);
+        if (FD_ISSET(tcp_server_fd, &read_fds)) accept_tcp_connection(tcp_server_fd);
     }
-
-    close(tcp_server_fd);
-    //close(tcp_client_fd);
-    close(udp_fd);
 
     return 0;
 }
