@@ -9,9 +9,13 @@
 #include <netdb.h>
 #include <string.h>
 #include <fcntl.h>
+#include <time.h>
 
 #define PORT "58001"
+#define UDP_SERVER_IP "193.136.138.142"
+#define UDP_SERVER_PORT "59000"
 #define MAX_CLIENTS 10
+#define BUFFER_SIZE 1024
 
 // Structure to track neighbors
 typedef struct {
@@ -39,6 +43,146 @@ void show_topology() {
     printf("\n----------------\n");
 }
 
+// Sends a UDP message to the UDP server
+void send_udp_message(const char *message) {
+    int udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (udp_fd == -1) {
+        perror("UDP socket error");
+        return;
+    }
+
+    struct sockaddr_in server_addr;
+    memset(&server_addr, 0, sizeof(server_addr));
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(atoi(UDP_SERVER_PORT));
+    inet_pton(AF_INET, UDP_SERVER_IP, &server_addr.sin_addr);
+
+    if (sendto(udp_fd, message, strlen(message), 0, (struct sockaddr*)&server_addr, sizeof(server_addr)) == -1) {
+        perror("UDP sendto error");
+    }
+
+    close(udp_fd);
+}
+
+// Receives a UDP message from the UDP server
+char* receive_udp_message() {
+    int udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (udp_fd == -1) {
+        perror("UDP socket error");
+        return NULL;
+    }
+
+    struct sockaddr_in server_addr;
+    memset(&server_addr, 0, sizeof(server_addr));
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(atoi(UDP_SERVER_PORT));
+    inet_pton(AF_INET, UDP_SERVER_IP, &server_addr.sin_addr);
+
+    char *buffer = malloc(BUFFER_SIZE);
+    if (!buffer) {
+        perror("malloc error");
+        close(udp_fd);
+        return NULL;
+    }
+
+    socklen_t addrlen = sizeof(server_addr);
+    int n = recvfrom(udp_fd, buffer, BUFFER_SIZE, 0, (struct sockaddr*)&server_addr, &addrlen);
+    if (n <= 0) {
+        perror("UDP recvfrom error");
+        free(buffer);
+        close(udp_fd);
+        return NULL;
+    }
+
+    buffer[n] = '\0';
+    close(udp_fd);
+    return buffer;
+}
+
+// Joins a network by sending a UDP message to the UDP server
+void join_network(const char *net) {
+    char message[32];
+    snprintf(message, sizeof(message), "NODES %s", net);
+    send_udp_message(message);
+
+    char *response = receive_udp_message();
+    if (!response) {
+        printf("Failed to receive response from UDP server.\n");
+        return;
+    }
+
+    printf("Received response: %s\n", response);
+
+    // Parse the response (NODESLIST net\nIP1 TCP1\nIP2 TCP2\n...)
+    char *line = strtok(response, "\n");
+    if (!line || strncmp(line, "NODESLIST", 9) != 0) {
+        printf("Invalid response format.\n");
+        free(response);
+        return;
+    }
+
+    // Randomly select a node from the list
+    srand(time(NULL));
+    char *nodes[BUFFER_SIZE];
+    int node_count = 0;
+
+    while ((line = strtok(NULL, "\n")) != NULL) {
+        nodes[node_count++] = line;
+    }
+
+    if (node_count == 0) {
+        printf("No nodes available in the network.\n");
+        free(response);
+        return;
+    }
+
+    char *selected_node = nodes[rand() % node_count];
+    char ip[INET_ADDRSTRLEN], tcp[6];
+    if (sscanf(selected_node, "%s %s", ip, tcp) != 2) {
+        printf("Failed to parse node information.\n");
+        free(response);
+        return;
+    }
+
+    printf("Selected node: %s:%s\n", ip, tcp);
+
+    // Connect to the selected node via TCP
+    int new_client_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (new_client_fd == -1) {
+        perror("TCP socket error");
+        free(response);
+        return;
+    }
+
+    struct sockaddr_in server_addr;
+    memset(&server_addr, 0, sizeof(server_addr));
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(atoi(tcp));
+    inet_pton(AF_INET, ip, &server_addr.sin_addr);
+
+    if (connect(new_client_fd, (struct sockaddr*)&server_addr, sizeof(server_addr)) == -1) {
+        perror("TCP connect error");
+        close(new_client_fd);
+        free(response);
+        return;
+    }
+
+    // Update external neighbor
+    node_info.external_neighbor = new_client_fd;
+    strcpy(node_info.ip, ip);
+    strcpy(node_info.tcp, tcp);
+    strcpy(node_info.network, net);
+
+    printf("Connected to external neighbor %s:%s\n", ip, tcp);
+
+    // Send REG message to the UDP server
+    char reg_message[128];
+    snprintf(reg_message, sizeof(reg_message), "REG %s %s %s", net, ip, tcp);
+    send_udp_message(reg_message);
+
+    free(response);
+}
+    
 // Handles user input commands
 void handle_input(int *client_fds) {
     char buffer[128];
@@ -49,12 +193,20 @@ void handle_input(int *client_fds) {
         char command[16], net[4], connectIP[32], connectTCP[6];
         int parsed = sscanf(buffer, "%15s %3s %31s %5s", command, net, connectIP, connectTCP);
 
-        if (strcmp(command, "show") == 0 && strcmp(net, "topology") == 0) {
+        // Handle "join" command
+        if (strcmp(command, "join") == 0 && parsed >= 2) {
+            join_network(net);
+            return;
+        }
+
+        // Handle "show topology" command
+        if (strcmp(command, "st") == 0) {
             show_topology();
             return;
         }
 
-        if (parsed >= 4 && strcmp(command, "direct") == 0) {
+        // Handle "direct" command
+        if (strcmp(command, "dj") == 0 && parsed >= 4) {
             printf("Joining network %s...\n", net);
             strcpy(node_info.network, net);  // Store network name
 
@@ -97,9 +249,14 @@ void handle_input(int *client_fds) {
             char entry_msg[128];
             snprintf(entry_msg, sizeof(entry_msg), "ENTRY %s %s\n", node_info.ip, node_info.tcp);
             send(new_client_fd, entry_msg, strlen(entry_msg), 0);
-        } else {
-            printf("Invalid command. Usage: direct join <net> <connectIP> <connectTCP>\n");
+            return;
         }
+
+        // If none of the above commands match, print an error message
+        printf("Invalid command. Usage:\n");
+        printf("  join <net>\n");
+        printf("  show topology\n");
+        printf("  direct <net> <connectIP> <connectTCP>\n");
     }
 }
 
